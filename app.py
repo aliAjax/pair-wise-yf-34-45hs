@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,10 @@ from urllib.parse import urlparse
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
+DECISIONS = {"approved", "rejected"}
+# 决定状态：effective=当前有效决定；superseded=计划或限制变化后失效；
+# pending_review=版本对不上或同版本冲突，转人工复核
+REVIEW_STATES = {"effective", "superseded", "pending_review"}
 
 
 class ApiError(Exception):
@@ -58,8 +63,13 @@ def validate_route(route: Any) -> list[list[float]]:
 class Repository:
     def __init__(self, path: str | Path):
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        # 所有写事务串行化：两个审核员同时回传时，先拿到锁先入库的一方生效
+        self.write_lock = threading.RLock()
         self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript("""
+        CREATE TABLE IF NOT EXISTS meta(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS restrictions(
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind TEXT NOT NULL, min_lon REAL NOT NULL, min_lat REAL NOT NULL,
             max_lon REAL NOT NULL, max_lat REAL NOT NULL, min_altitude REAL NOT NULL DEFAULT 0, max_altitude REAL NOT NULL,
@@ -74,8 +84,9 @@ class Repository:
         );
         CREATE TABLE IF NOT EXISTS approvals(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id), plan_revision INTEGER NOT NULL,
-            reviewer TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, offline_id TEXT UNIQUE,
-            override_kind TEXT, created_at TEXT NOT NULL
+            restrictions_version INTEGER NOT NULL, reviewer TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+            offline_id TEXT UNIQUE, override_kind TEXT, state TEXT NOT NULL DEFAULT 'effective', conflicts_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS notifications(
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id), kind TEXT NOT NULL,
@@ -86,12 +97,22 @@ class Repository:
             detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        # 轻量迁移：为既有数据库补齐新列，空域限制集合版本从 1 开始
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(approvals)")}
+        if "restrictions_version" not in existing: self.conn.execute("ALTER TABLE approvals ADD COLUMN restrictions_version INTEGER NOT NULL DEFAULT 1")
+        if "state" not in existing: self.conn.execute("ALTER TABLE approvals ADD COLUMN state TEXT NOT NULL DEFAULT 'effective'")
+        if "conflicts_json" not in existing: self.conn.execute("ALTER TABLE approvals ADD COLUMN conflicts_json TEXT NOT NULL DEFAULT '[]'")
+        self.conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('restrictions_version','1')")
+
+    def restrictions_version(self) -> int:
+        return int(self.conn.execute("SELECT value FROM meta WHERE key='restrictions_version'").fetchone()["value"])
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try: yield self.conn; self.conn.execute("COMMIT")
-        except Exception: self.conn.execute("ROLLBACK"); raise
+        with self.write_lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try: yield self.conn; self.conn.execute("COMMIT")
+            except Exception: self.conn.execute("ROLLBACK"); raise
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -128,9 +149,31 @@ class DroneAirspaceService:
         if min_lon >= max_lon or min_lat >= max_lat or min_alt < 0 or max_alt <= min_alt or end <= start:
             raise ApiError(400, "invalid_restriction", "空域范围、高度或时间无效")
         with self.repo.tx() as conn:
-            cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
-            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+            cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,status,created_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,'active',?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
+            new_row = conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone()
+            # 空域限制集合发生变化：版本号 +1
+            conn.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='restrictions_version'")
+            new_version = self.repo.restrictions_version()
+            # 已批准计划若与新限制空域/时间/高度重叠，原批准立即失效并要求重新审批
+            invalidated: list[dict[str, Any]] = []
+            for plan in conn.execute("SELECT * FROM flight_plans WHERE status='approved'"):
+                p_start, p_end = parse_time(plan["starts_at"]), parse_time(plan["ends_at"])
+                bbox = route_bbox(self._route(plan))
+                if self._restriction_hits_plan(new_row, bbox, p_start, p_end, plan["max_altitude"]):
+                    conflict = [{"code": "restriction_changed", "restriction_id": new_row["id"], "name": new_row["name"],
+                                 "restrictions_version": new_version,
+                                 "message": "空域限制集合发生变化且与本计划冲突，原批准失效，必须重新审批"}]
+                    count = self._invalidate_approvals(conn, plan["id"], conflict, actor, role, "approval_invalidated_by_restriction")
+                    if count:
+                        conn.execute("UPDATE flight_plans SET status='draft',updated_at=? WHERE id=?", (iso(), plan["id"]))
+                        Repository.notify(conn, plan["id"], "approval_invalidated",
+                                          f"飞行计划 {plan['callsign']} 与新增空域限制 {name} 冲突，原批准已失效，需要重新审批")
+                        invalidated.append({"plan_id": plan["id"], "callsign": plan["callsign"]})
+            Repository.audit(conn, None, actor, role, "restriction_created",
+                             {"restriction_id": cur.lastrowid, "restrictions_version": new_version, "invalidated_plans": invalidated})
+            result = dict(new_row); result["restrictions_version"] = new_version; result["invalidated_plans"] = invalidated
+            return result
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -168,6 +211,32 @@ class DroneAirspaceService:
             if role not in {"operator", "airspace_reviewer", "commander", "auditor", "viewer"}: raise ApiError(403, "check_forbidden", "无权检查冲突")
             return self._conflict_report(conn, plan)
 
+    @staticmethod
+    def _approval_dict(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["conflicts"] = json.loads(item.pop("conflicts_json", "[]") or "[]")
+        return item
+
+    def _active_approvals(self, conn: sqlite3.Connection, plan_id: int) -> list[sqlite3.Row]:
+        return list(conn.execute("SELECT * FROM approvals WHERE plan_id=? AND state='effective' ORDER BY id", (plan_id,)))
+
+    def _invalidate_approvals(self, conn: sqlite3.Connection, plan_id: int, conflicts: list[dict[str, Any]], actor: str = "system", role: str = "system", action: str = "approval_superseded") -> int:
+        """计划或限制变化后，把该计划上仍有效的决定全部置为失效。"""
+        rows = self._active_approvals(conn, plan_id)
+        for row in rows:
+            conn.execute("UPDATE approvals SET state='superseded', conflicts_json=? WHERE id=?",
+                         (json.dumps(conflicts, ensure_ascii=False), row["id"]))
+            Repository.audit(conn, plan_id, actor, role, action,
+                             {"approval_id": row["id"], "offline_id": row["offline_id"], "conflicts": conflicts})
+        return len(rows)
+
+    @staticmethod
+    def _restriction_hits_plan(restriction: sqlite3.Row, bbox: tuple[float, float, float, float], start: datetime, end: datetime, max_altitude: float) -> bool:
+        rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
+        if not boxes_overlap(bbox, rbox): return False
+        if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): return False
+        return max_altitude > restriction["min_altitude"] and restriction["max_altitude"] > 0
+
     def _conflict_report(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> dict[str, Any]:
         route = self._route(plan); bbox = route_bbox(route); start, end = parse_time(plan["starts_at"]), parse_time(plan["ends_at"])
         hard: list[dict[str, Any]] = []; blocking: list[dict[str, Any]] = []
@@ -175,11 +244,7 @@ class DroneAirspaceService:
         if plan["max_altitude"] > 120: hard.append({"code": "altitude_limit", "message": "常规计划高度不得超过 120m"})
         if plan["population_risk"] > 3: blocking.append({"code": "population_risk", "risk": plan["population_risk"], "message": "人口风险超过常规批准阈值"})
         for restriction in conn.execute("SELECT * FROM restrictions WHERE status='active'"):
-            rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
-            if not boxes_overlap(bbox, rbox): continue
-            if not times_overlap(start, end, parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
-            altitude_overlap = plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0
-            if altitude_overlap:
+            if self._restriction_hits_plan(restriction, bbox, start, end, plan["max_altitude"]):
                 item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
                 blocking.append(item)
         adjacent: list[dict[str, Any]] = []
@@ -187,7 +252,8 @@ class DroneAirspaceService:
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
                 adjacent.append({"plan_id": other["id"], "callsign": other["callsign"], "operator_id": other["operator_id"], "status": other["status"], "starts_at": other["starts_at"], "ends_at": other["ends_at"]})
         if adjacent: blocking.append({"code": "adjacent_traffic", "plans": adjacent, "message": "相邻航路与有效计划重叠"})
-        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
+        return {"plan_id": plan["id"], "revision": plan["revision"], "restrictions_version": self.repo.restrictions_version(),
+                "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
 
     def get_plan(self, plan_id: int, role: str, operator: str = "") -> dict[str, Any]:
         conn = self.repo.conn; row = self._plan_row(conn, plan_id)
@@ -195,7 +261,7 @@ class DroneAirspaceService:
         result = dict(row); result["route"] = json.loads(result.pop("route_json")); result["route_bbox"] = route_bbox(result["route"])
         if role == "viewer":
             result = {key: result[key] for key in ("id", "callsign", "starts_at", "ends_at", "max_altitude", "region", "status", "valid_until" if "valid_until" in result else "updated_at")}
-        if role in {"airspace_reviewer", "commander", "auditor"}: result["approvals"] = [dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan_id,))]
+        if role in {"airspace_reviewer", "commander", "auditor"}: result["approvals"] = [self._approval_dict(r) for r in conn.execute("SELECT * FROM approvals WHERE plan_id=? ORDER BY id", (plan_id,))]
         return result
 
     def submit(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -210,50 +276,113 @@ class DroneAirspaceService:
             Repository.audit(conn, plan_id, actor, role, "plan_submitted", {"revision": plan["revision"]})
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
 
-    def approve(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
-        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "只有空域审核员或指挥官可以批准")
-        expected, offline_id = body.get("expected_revision"), str(body.get("offline_id", "")).strip()
-        reason, override = str(body.get("reason", "")).strip(), str(body.get("override_reason", "")).strip()
-        if not isinstance(expected, int) or not offline_id or not reason: raise ApiError(400, "review_details_required", "expected_revision、offline_id 和 reason 必填")
+    def _store_review(self, conn: sqlite3.Connection, plan: sqlite3.Row, actor: str, role: str, decision: str,
+                      reason: str, offline_id: str, expected_plan_rev: int, expected_restrictions_version: int,
+                      state: str, conflicts: list[dict[str, Any]], override_kind: str | None,
+                      notify_kind: str, notify_message: str, audit_action: str) -> int:
+        cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,restrictions_version,reviewer,decision,reason,offline_id,override_kind,state,conflicts_json,created_at)
+                              VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                           (plan["id"], expected_plan_rev, expected_restrictions_version, actor, decision, reason,
+                            offline_id, override_kind, state, json.dumps(conflicts, ensure_ascii=False), iso()))
+        audit_detail: dict[str, Any] = {"plan_revision": expected_plan_rev, "restrictions_version": expected_restrictions_version,
+                                        "offline_id": offline_id, "state": state}
+        if conflicts: audit_detail["conflicts"] = conflicts
+        if override_kind: audit_detail["override_kind"] = override_kind
+        Repository.audit(conn, plan["id"], actor, role, audit_action, audit_detail)
+        Repository.notify(conn, plan["id"], notify_kind, notify_message)
+        return cur.lastrowid
+
+    def _review_result(self, conn: sqlite3.Connection, plan_id: int, role: str, approval_id: int | None,
+                       state: str, conflicts: list[dict[str, Any]], idempotent: bool, override_kind: str | None = None) -> dict[str, Any]:
+        result: dict[str, Any] = {"plan": self.get_plan(plan_id, role, ""), "idempotent": idempotent,
+                                  "decision_state": state, "conflicts": conflicts}
+        if approval_id is not None: result["approval_id"] = approval_id
+        if override_kind is not None: result["override_kind"] = override_kind
+        return result
+
+    def _merge_review(self, plan_id: int, actor: str, role: str, body: dict[str, Any], decision: str) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}:
+            raise ApiError(403, "review_forbidden", "只有空域审核员或指挥官可以审核计划")
+        expected_rev, offline_id = body.get("expected_revision"), str(body.get("offline_id", "")).strip()
+        reason = str(body.get("reason", "")).strip()
+        override = str(body.get("override_reason", "")).strip()
+        if not isinstance(expected_rev, int) or not offline_id or not reason:
+            raise ApiError(400, "review_details_required", "expected_revision、offline_id 和 reason 必填")
+        # 离线端可回传决定所依据的空域限制集合版本；缺省时按当前版本处理
+        expected_rv = body.get("expected_restrictions_version")
+        if expected_rv is None: expected_rv = self.repo.restrictions_version()
+        if not isinstance(expected_rv, int) or expected_rv < 1:
+            raise ApiError(400, "invalid_restrictions_version", "expected_restrictions_version 必须是正整数")
         with self.repo.tx() as conn:
+            # 离线编号幂等：同一编号重试只返回已入库结果，绝不重复写入
             prior = conn.execute("SELECT * FROM approvals WHERE offline_id=?", (offline_id,)).fetchone()
             if prior:
-                if prior["plan_id"] == plan_id and prior["plan_revision"] == expected and prior["decision"] == "approved":
-                    return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True, "approval_id": prior["id"]}
-                raise ApiError(409, "offline_id_conflict", "该离线审核编号已经用于其他决定")
+                if prior["plan_id"] != plan_id or prior["decision"] != decision:
+                    raise ApiError(409, "offline_id_conflict", "该离线审核编号已经用于其他决定")
+                return self._review_result(conn, plan_id, role, prior["id"], prior["state"],
+                                           self._approval_dict(prior)["conflicts"], True, prior["override_kind"])
             plan = self._plan_row(conn, plan_id)
-            if plan["status"] == "approved": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
-            if plan["status"] != "submitted": raise ApiError(409, "invalid_transition", "只有已提交计划可以批准")
-            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，审核决定不能套用")
+            if plan["status"] in {"canceled", "expired"}:
+                raise ApiError(409, "plan_closed", "已取消或过期的计划不能再审核")
+            # 三维合并校验之一：飞行计划版本必须一致，不一致直接拒绝套用旧决定
+            # （即使计划已回到 draft，旧版本决定也要明确报版本失效，而不是“未提交”）
+            if plan["revision"] != expected_rev:
+                raise ApiError(409, "revision_conflict", "计划版本已变化，旧审核决定不能套用，请基于新版本重新审批")
+            if plan["status"] == "draft":
+                raise ApiError(409, "invalid_transition", "当前版本尚未提交，不能审核")
+            current_rv = self.repo.restrictions_version()
+            conflicts: list[dict[str, Any]] = []
+            # 三维合并校验之三：同版本是否已有先入库的决定（先查，避免被计划状态挡住）
+            existing = self._active_approvals(conn, plan_id)
+            if existing:
+                winner = existing[-1]
+                conflicts.append({"code": "concurrent_decision", "existing_approval_id": winner["id"],
+                                  "existing_reviewer": winner["reviewer"], "existing_decision": winner["decision"],
+                                  "existing_plan_revision": winner["plan_revision"],
+                                  "existing_restrictions_version": winner["restrictions_version"],
+                                  "message": "同一计划版本已有先入库的审核决定，后到决定转入待复核"})
+            # 用当前约束重算，供陈旧版本决定列出此刻的真实冲突
             report = self._conflict_report(conn, plan)
-            if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
-            if report["blocking_conflicts"] and not (role == "commander" and override):
-                raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
-            override_kind = "emergency_authority" if report["blocking_conflicts"] else None
-            cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
-                                  VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
-            conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
-            if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
-            Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
-            Repository.notify(conn, plan_id, "approved", f"飞行计划 {plan['callsign']} 已批准")
-            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid, "override_kind": override_kind}
+            # 三维合并校验之二：空域限制集合版本一致，否则决定依据已变，连同当前冲突一起列出
+            if expected_rv != current_rv:
+                conflicts.append({"code": "restrictions_version_stale", "expected_restrictions_version": expected_rv,
+                                  "current_restrictions_version": current_rv,
+                                  "hard_violations": report["hard_violations"], "blocking_conflicts": report["blocking_conflicts"],
+                                  "message": "离线决定依据的空域限制集合已变化，旧决定不能直接生效"})
+            if conflicts:
+                approval_id = self._store_review(
+                    conn, plan, actor, role, decision, reason, offline_id, expected_rev, expected_rv,
+                    "pending_review", conflicts, None, "pending_review",
+                    f"飞行计划 {plan['callsign']} 的离线{('批准' if decision == 'approved' else '拒绝')}决定存在冲突，已转入待复核",
+                    "decision_pending_review")
+                return self._review_result(conn, plan_id, role, approval_id, "pending_review", conflicts, False)
+            # 走到这里同版本没有任何有效决定；已拒绝状态说明决定已被其他路径固化
+            if plan["status"] == "rejected":
+                raise ApiError(409, "revision_conflict", "计划当前版本已被拒绝，需要重新提交后再审批")
+            if decision == "approved":
+                if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
+                if report["blocking_conflicts"] and not (role == "commander" and override):
+                    raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
+                override_kind = "emergency_authority" if report["blocking_conflicts"] else None
+                approval_id = self._store_review(
+                    conn, plan, actor, role, "approved", reason, offline_id, expected_rev, current_rv,
+                    "effective", [], override_kind, "approved", f"飞行计划 {plan['callsign']} 已批准", "plan_approved")
+                conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
+                if override_kind:
+                    Repository.audit(conn, plan_id, actor, role, "emergency_override_used",
+                                     {"override_reason": override, "conflicts": report["blocking_conflicts"]})
+                return self._review_result(conn, plan_id, role, approval_id, "effective", [], False, override_kind)
+            approval_id = self._store_review(
+                conn, plan, actor, role, "rejected", reason, offline_id, expected_rev, current_rv,
+                "effective", [], None, "rejected", f"飞行计划 {plan['callsign']} 被拒绝：{reason}", "plan_rejected")
+            conn.execute("UPDATE flight_plans SET status='rejected',updated_at=? WHERE id=?", (iso(), plan_id))
+            return self._review_result(conn, plan_id, role, approval_id, "effective", [], False)
+
+    def approve(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._merge_review(plan_id, actor, role, body, "approved")
 
     def reject(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
-        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "当前角色不能拒绝计划")
-        expected, offline_id, reason = body.get("expected_revision"), str(body.get("offline_id", "")).strip(), str(body.get("reason", "")).strip()
-        if not isinstance(expected, int) or not offline_id or not reason: raise ApiError(400, "review_details_required", "expected_revision、offline_id 和 reason 必填")
-        with self.repo.tx() as conn:
-            prior = conn.execute("SELECT * FROM approvals WHERE offline_id=?", (offline_id,)).fetchone()
-            if prior:
-                if prior["plan_id"] == plan_id and prior["plan_revision"] == expected and prior["decision"] == "rejected": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
-                raise ApiError(409, "offline_id_conflict", "该离线审核编号已经被使用")
-            plan = self._plan_row(conn, plan_id)
-            if plan["status"] != "submitted" or plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划状态或版本不匹配")
-            conn.execute("INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,created_at) VALUES(?,?,?,?,?,?,?)", (plan_id, expected, actor, "rejected", reason, offline_id, iso()))
-            conn.execute("UPDATE flight_plans SET status='rejected',updated_at=? WHERE id=?", (iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_rejected", {"reason": reason, "offline_id": offline_id})
-            Repository.notify(conn, plan_id, "rejected", f"飞行计划 {plan['callsign']} 被拒绝：{reason}")
-            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False}
+        return self._merge_review(plan_id, actor, role, body, "rejected")
 
     def change(self, plan_id: int, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "change_forbidden", "只有运营方可以变更计划")
@@ -271,9 +400,13 @@ class DroneAirspaceService:
             risk = body.get("population_risk", plan["population_risk"])
             if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5: raise ApiError(400, "invalid_plan", "变更后的载荷、高度或风险无效")
             revision = expected + 1
+            # 计划变化：原版本上仍有效的全部决定立即失效，必须重新审批
+            stale_conflict = [{"code": "plan_revision_changed", "previous_revision": expected, "current_revision": revision,
+                               "message": "飞行计划已修改，旧版本上的审核决定全部失效，需要重新审批"}]
+            stale_count = self._invalidate_approvals(conn, plan_id, stale_conflict, actor, role, "approval_invalidated_by_plan_change")
             conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
-            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
+            Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"], "invalidated_approvals": stale_count})
             if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
             return self.get_plan(plan_id, role, operator)
@@ -291,6 +424,23 @@ class DroneAirspaceService:
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
+
+    def pending_reviews(self, role: str, operator: str) -> dict[str, Any]:
+        """列出转入待复核的离线决定及其冲突。"""
+        if role == "operator":
+            rows = self.repo.conn.execute("""SELECT a.* FROM approvals a JOIN flight_plans p ON p.id=a.plan_id
+                                             WHERE a.state='pending_review' AND p.operator_id=? ORDER BY a.id""", (operator,))
+        elif role in {"airspace_reviewer", "commander", "auditor"}:
+            rows = self.repo.conn.execute("SELECT * FROM approvals WHERE state='pending_review' ORDER BY id")
+        else:
+            raise ApiError(403, "pending_reviews_forbidden", "当前角色不能查看待复核决定")
+        items = []
+        for row in rows:
+            item = self._approval_dict(row)
+            plan = self.repo.conn.execute("SELECT callsign,revision,status,operator_id FROM flight_plans WHERE id=?", (row["plan_id"],)).fetchone()
+            item["plan"] = dict(plan) if plan else None
+            items.append(item)
+        return {"restrictions_version": self.repo.restrictions_version(), "pending_reviews": items, "count": len(items)}
 
     def notifications(self, actor: str, role: str, operator: str) -> dict[str, Any]:
         if role == "operator":
@@ -319,7 +469,11 @@ class DroneAirspaceService:
         for row in rows:
             item = self.get_plan(row["id"], role, operator); plans.append(item)
         restrictions = [dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active' ORDER BY id DESC")] if role in {"airspace_reviewer", "commander", "auditor"} else []
-        return {"plans": plans, "restrictions": restrictions, "server_time": iso()}
+        payload: dict[str, Any] = {"plans": plans, "restrictions": restrictions,
+                                   "restrictions_version": self.repo.restrictions_version(), "server_time": iso()}
+        if role in {"airspace_reviewer", "commander", "auditor"}:
+            payload["pending_review_count"] = conn.execute("SELECT COUNT(*) AS c FROM approvals WHERE state='pending_review'").fetchone()["c"]
+        return payload
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -341,6 +495,7 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/pending-reviews": return 200, self.service.pending_reviews(role, operator)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
