@@ -1,6 +1,6 @@
 # 无人机飞行计划审批与空域协调系统
 
-标准库独立项目。系统记录运营方计划、航线、载荷、高度、人口风险和应急方案，检查临时禁飞区、高度范围、人口风险以及相邻有效计划冲突。审核结果支持离线编号幂等回传，计划变更会使原批准失效并生成通知。
+标准库独立项目。系统记录运营方计划、航线、载荷、高度、人口风险和应急方案，检查临时禁飞区、高度范围、人口风险以及相邻有效计划冲突。审核结果支持离线编号幂等回传，离线决定合并校验飞行计划版本与空域限制集合版本：任一版本变化，原决定即失效并要求重新审批；同一版本先入库的决定生效，后到决定转入待复核并列出冲突。计划或限制变更会生成通知。
 
 ## 运行
 
@@ -17,7 +17,9 @@ python3 app.py --db drone_airspace.db
 - `POST /api/restrictions`：新增临时限制或禁飞区。
 - `POST /api/plans`：创建飞行计划。
 - `GET /api/plans/{id}/check`：检查硬约束和相邻交通冲突。
-- `POST /api/plans/{id}/submit`、`approve`、`reject`：提交和审核；审核使用 `offline_id` 保证断网重连幂等。
+- `POST /api/plans/{id}/submit`、`approve`、`reject`：提交和审核；审核使用 `offline_id` 保证断网重连幂等。离线决定须携带 `expected_revision` 与 `restriction_version`（空域限制集合版本，可由 `/api/plans/{id}/check` 或 `/api/state` 获取），两者与当前版本一致才生效；版本变化则决定失效，须用新的 `offline_id` 重新决定。同一版本已有生效决定时，后到决定转入待复核并列出冲突。
+- `GET /api/pending-reviews`：列出待复核的离线决定及冲突。
+- `POST /api/approvals/{id}/resolve`：指挥官复核待决定（apply/dismiss）。
 - `POST /api/plans/{id}/change`、`cancel`：版本化变更与取消，并生成通知。
 - `GET /api/notifications`、`POST /api/expire`：通知与到期处理。
 - `GET /api/state`：按角色返回计划、限制和公开信息。
